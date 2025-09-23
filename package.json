@@ -1,0 +1,19 @@
+{
+  "name": "elm-audio-left-right",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@astermind/astermind-elm": "^2.1.0",
+    "meyda": "^5.6.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0",
+    "vite": "^5.4.0"
+  }
+}
