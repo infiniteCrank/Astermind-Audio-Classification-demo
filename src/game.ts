@@ -43,18 +43,39 @@ export class InfiniteRunnerGame {
         this.scoreEl = document.querySelector('#score');
         this.speedEl = document.querySelector('#speed');
 
-        window.addEventListener('voice-command', ((e: CustomEvent) => {
-            const label: VoiceLabel = e.detail.label;
-            if (!this.running) return;
-            if (label === 'LEFT') this.moveLeft();
-            else if (label === 'RIGHT') this.moveRight();
-        }) as EventListener);
+        // Voice control
+        const voiceHandler = (e: Event) => {
+            const ce = e as CustomEvent;
+            const raw = ce?.detail?.label;
+            if (!raw) return;
+            const label = String(raw).toUpperCase() as VoiceLabel;
+            this.handleInput(label);
+        };
+        window.addEventListener('voice-command', voiceHandler as EventListener);
 
-        window.addEventListener('keydown', (e) => {
+        // Keyboard control (listen on both window & document; prevent default)
+        const keyHandler = (e: KeyboardEvent) => {
             if (!this.running) return;
-            if (e.key === 'ArrowLeft') this.moveLeft();
-            if (e.key === 'ArrowRight') this.moveRight();
-        });
+            if (e.key === 'ArrowLeft' || e.code === 'ArrowLeft' || e.key === 'Left') {
+                e.preventDefault();
+                this.moveLeft();
+            } else if (e.key === 'ArrowRight' || e.code === 'ArrowRight' || e.key === 'Right') {
+                e.preventDefault();
+                this.moveRight();
+            }
+        };
+        window.addEventListener('keydown', keyHandler, { capture: true });
+        document.addEventListener('keydown', keyHandler, { capture: true });
+
+        // Initial paint
+        this.draw();
+        this.updateHUD();
+    }
+
+    private handleInput(label: VoiceLabel) {
+        if (!this.running) return;
+        if (label === 'LEFT') this.moveLeft();
+        else if (label === 'RIGHT') this.moveRight();
     }
 
     start() {
@@ -129,8 +150,6 @@ export class InfiniteRunnerGame {
         // lanes
         g.strokeStyle = '#333';
         g.lineWidth = 2;
-        const laneColor = '#333';
-        g.strokeStyle = laneColor;
         for (let i = 0; i < this.lanes; i++) {
             const x = this.laneXs[i];
             g.beginPath();

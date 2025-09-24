@@ -59,11 +59,11 @@ function log(s: string) {
 }
 
 /** ───────────────────────── Config knobs ───────────────────────── **/
-// Looser thresholds so we don't get stuck on "…"
-const VAD_ENTER = 0.005;   // need this RMS to start speech
-const VAD_EXIT = 0.003;   // drop below this to end speech (hysteresis)
-let CONF_THRESHOLD = 0.40; // only confident frames update the vote buffer
-const PRED_WINDOW = 5;       // majority vote window
+// Hysteretic VAD so we don't flicker
+const VAD_ENTER = 0.005;
+const VAD_EXIT = 0.003;
+let CONF_THRESHOLD = 0.40;
+const PRED_WINDOW = 5;
 const REQUIRE_VAD = true;
 const MFCC_OPTS = { trimThreshold: 0.003, allowUntrimFallback: true, padToFrame: true };
 
@@ -85,11 +85,13 @@ let listenTimer: number | null = null;
 const lastPreds: number[] = [];
 let inSpeech = false;
 let lastStable: 'LEFT' | 'RIGHT' | null = null;
+// NEW: fire one command per utterance
+let utteranceFired = false;
 
-// reset votes on rising edge (fixes stale flashes)
 function resetVotes() {
   lastPreds.length = 0;
   predEl.textContent = '…';
+  utteranceFired = false;
   dbg.note('speech start (cleared votes)');
 }
 
@@ -225,13 +227,13 @@ async function livePredictTick() {
   // hysteretic VAD
   const speechNow = !REQUIRE_VAD || (inSpeech ? e >= VAD_EXIT : e >= VAD_ENTER);
 
-  // handle VAD edges
+  // VAD edges
   if (!inSpeech && speechNow) {
     inSpeech = true;
-    resetVotes();                 // clear old votes ONLY (don't flush audio)
-    // continue to extract features this tick so UI feels snappy
+    resetVotes();                 // clear old votes ONLY
+    // continue; we still extract features this tick
   } else if (inSpeech && !speechNow) {
-    inSpeech = false;             // go idle
+    inSpeech = false;
     predEl.textContent = '…';
     dbg.note('silence');
     return;
@@ -270,21 +272,23 @@ async function livePredictTick() {
 
   const { idx, val } = argmax(probs);
 
-  // Always show the immediate (ephemeral) prediction
+  // Ephemeral label for responsiveness
   const ephemeralLabel = idx === 0 ? 'LEFT' : 'RIGHT';
   predEl.textContent = ephemeralLabel;
 
-  // Only push votes when confident to build a stable majority
+  // Build stable majority only with confident frames
   if (val >= CONF_THRESHOLD) pushPred(idx);
 
-  // If we have some votes, prefer the majority (stable) label
   const maj = majority();
   if (maj !== null) {
     const label = maj === 0 ? 'LEFT' : 'RIGHT';
     predEl.textContent = label;
-    if (label !== lastStable) {
-      lastStable = label;
+
+    // FIRE ONCE PER UTTERANCE (even if same as previous label)
+    if (!utteranceFired && val >= CONF_THRESHOLD) {
+      utteranceFired = true;
       window.dispatchEvent(new CustomEvent('voice-command', { detail: { label } }));
+      lastStable = label;
     }
   } else {
     dbg.note(`ephemeral: ${ephemeralLabel} (conf=${val.toFixed(2)})`);
@@ -293,10 +297,11 @@ async function livePredictTick() {
 
 function startListening() {
   if (listenTimer) return;
-  // reset global state at start of session
+  // reset session state
   lastPreds.length = 0;
   inSpeech = false;
   lastStable = null;
+  utteranceFired = false;
 
   listenTimer = window.setInterval(livePredictTick, 250);
   predEl.textContent = '…';
@@ -345,6 +350,7 @@ async function resetModel() {
     listenBtn.disabled = true;
     saveBtn.disabled = true;
     lastStable = null;
+    utteranceFired = false;
     log('Model reset (worker + IndexedDB cleared).');
   } catch (e: any) {
     log('Reset error: ' + e.message);
