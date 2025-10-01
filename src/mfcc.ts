@@ -44,7 +44,7 @@ export async function extractFeaturesMonoFloat32(
   // 1) Normalize amplitude
   const norm = normalize(float32);
 
-  // 2) Trim silence (but be conservative)
+  // 2) Trim silence (conservative)
   let sig = trimSilence(norm, trimThreshold);
 
   const frameSize = pickFrameSize(sampleRate);
@@ -55,11 +55,11 @@ export async function extractFeaturesMonoFloat32(
     sig = norm;
   }
 
-  // 4) If STILL too short, pad with zeros (tail-pad so we keep the most recent speech)
+  // 4) If STILL too short, pad with zeros (tail-pad)
   if (sig.length < frameSize && padToFrame) {
     const padded = new Float32Array(frameSize);
     const copyLen = Math.min(sig.length, frameSize);
-    padded.set(sig.subarray(sig.length - copyLen), frameSize - copyLen); // right-align
+    padded.set(sig.subarray(sig.length - copyLen), frameSize - copyLen);
     sig = padded;
   }
 
@@ -74,7 +74,7 @@ export async function extractFeaturesMonoFloat32(
 
   const mfccs: number[][] = [];
 
-  // 5) Slide windows; collect MFCC arrays
+  // 5) Slide windows; collect MFCC arrays (Meyda returns number[])
   for (let i = 0; i + frameSize <= sig.length; i += hop) {
     const frame = sig.subarray(i, i + frameSize);
     try {

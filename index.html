@@ -1,56 +1,145 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Left/Right Voice Classifier — AsterMind ELM</title>
-    <style>
-      :root { color-scheme: light dark; }
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; line-height: 1.4; }
-      h1 { font-size: 1.6rem; margin-bottom: 0.5rem; }
-      .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin: 8px 0; }
-      button { padding: 8px 12px; border-radius: 8px; border: 1px solid #aaa; cursor: pointer; }
-      button:disabled { opacity: 0.6; cursor: not-allowed; }
-      .chip { padding: 4px 8px; border-radius: 999px; background: #eee; color: #333; }
-      #log { white-space: pre-wrap; padding: 12px; border-radius: 8px; min-height: 120px; border: 1px solid #444; }
-      .muted { opacity: 0.8; font-size: 0.9rem; }
-    </style>
-  </head>
-  <body>
-    <h1>Left/Right Voice Classifier</h1>
-    <p class="muted">
-      Speak “left” 4 times and “right” 4 times to train a tiny on-device model (ELM or Kernel ELM). Then test live.
-    </p>
 
-    <div class="row">
-      <button id="micBtn">🎙️ Enable Mic</button>
-      <span id="micStatus" class="chip">mic: off</span>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ELM Voice Controller — Left/Right + Infinite Runner</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      margin: 24px;
+      line-height: 1.4;
+    }
+
+    h1 {
+      font-size: 1.6rem;
+      margin-bottom: 0.25rem;
+    }
+
+    h2 {
+      font-size: 1.2rem;
+      margin-top: 1.2rem;
+    }
+
+    .row {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin: 8px 0;
+    }
+
+    button {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid #aaa;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .chip {
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: #eee;
+      color: #333;
+    }
+
+    #log {
+      white-space: pre-wrap;
+      padding: 12px;
+      border-radius: 10px;
+      min-height: 120px;
+      border: 1px solid #444;
+    }
+
+    #gameWrap {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: start;
+    }
+
+    #gameCanvas {
+      border: 2px solid #666;
+      border-radius: 10px;
+      background: linear-gradient(180deg, #111, #222);
+    }
+
+    #hud {
+      display: grid;
+      gap: 10px;
+    }
+
+    #hud .stat {
+      font-weight: 600;
+    }
+
+    .muted {
+      opacity: 0.85;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>Voice Classifier (ELM/KELM) + 3-Lane Runner</h1>
+  <p class="muted">Say “left” / “right” to control the runner. Train, save to IndexedDB, load later, or reset.</p>
+
+  <h2>Mic & Training</h2>
+  <div class="row">
+    <button id="micBtn">🎙️ Enable Mic</button>
+    <span id="micStatus" class="chip">mic: off</span>
+  </div>
+
+  <div class="row">
+    <button id="recLeft">Record “left”</button>
+    <span id="leftCount" class="chip">0 / 4</span>
+    <button id="recRight">Record “right”</button>
+    <span id="rightCount" class="chip">0 / 4</span>
+  </div>
+
+  <div class="row">
+    <button id="trainBtn" disabled>🚀 Train Model</button>
+    <span id="trainStatus" class="chip">not trained</span>
+    <button id="listenBtn" disabled>🔎 Start Live Listen</button>
+    <span id="pred" class="chip">—</span>
+  </div>
+
+  <h2>Persistence (IndexedDB)</h2>
+  <div class="row">
+    <button id="saveBtn" disabled>💾 Save Model</button>
+    <button id="loadBtn">📥 Load Model</button>
+    <button id="resetModelBtn">🧹 Reset Model</button>
+  </div>
+
+  <h2>Game</h2>
+  <div id="gameWrap">
+    <canvas id="gameCanvas" width="480" height="720"></canvas>
+    <div id="hud">
+      <div class="stat">Score: <span id="score">0</span></div>
+      <div class="stat">Speed: <span id="speed">0</span></div>
+      <div class="row">
+        <button id="startGameBtn">▶️ Start Game</button>
+        <button id="pauseGameBtn" disabled>⏸ Pause</button>
+        <button id="resetGameBtn">🔁 Reset</button>
+      </div>
+      <div class="muted">Controls: Voice “left/right” or ← → keys</div>
     </div>
+  </div>
 
-    <h3>Collect Training Samples</h3>
-    <div class="row">
-      <button id="recLeft">Record “left”</button>
-      <span id="leftCount" class="chip">0 / 4</span>
-    </div>
-    <div class="row">
-      <button id="recRight">Record “right”</button>
-      <span id="rightCount" class="chip">0 / 4</span>
-    </div>
+  <h2>Log</h2>
+  <div id="log"></div>
 
-    <div class="row">
-      <button id="trainBtn" disabled>🚀 Train Model</button>
-      <span id="trainStatus" class="chip">not trained</span>
-    </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
 
-    <h3>Live Test</h3>
-    <div class="row">
-      <button id="listenBtn" disabled>🔎 Start Live Listen</button>
-      <span id="pred" class="chip">—</span>
-    </div>
-
-    <h3>Log</h3>
-    <div id="log"></div>
-
-    <script type="module" src="/src/main.ts"></script>
-  </body>
 </html>

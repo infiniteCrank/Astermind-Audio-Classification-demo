@@ -1,9 +1,10 @@
 // src/main.ts
 import { extractFeaturesMonoFloat32 } from './mfcc';
 import WorkerCtor from './worker.ts?worker';
+import { saveModelToIDB, loadModelFromIDB, deleteModelFromIDB } from './idb';
+import { InfiniteRunnerGame } from './game';
 
-const $ = <T extends Element = Element>(sel: string) =>
-  document.querySelector(sel) as T;
+const $ = <T extends Element = Element>(sel: string) => document.querySelector(sel) as T;
 
 const logEl = $('#log') as HTMLDivElement;
 
@@ -18,39 +19,18 @@ const trainStatus = $('#trainStatus') as HTMLSpanElement;
 const listenBtn = $('#listenBtn') as HTMLButtonElement;
 const predEl = $('#pred') as HTMLSpanElement;
 
-function log(s: string) {
-  logEl.textContent += s + '\n';
-  logEl.scrollTop = logEl.scrollHeight;
-}
+const saveBtn = $('#saveBtn') as HTMLButtonElement;
+const loadBtn = $('#loadBtn') as HTMLButtonElement;
+const resetModelBtn = $('#resetModelBtn') as HTMLButtonElement;
 
-/** ───────────────────────── Config knobs ───────────────────────── **/
-let VAD_RMS_THRESHOLD = 0.006;  // lower lets more speech through
-let CONF_THRESHOLD = 0.50;      // allow slightly lower confidence
-const PRED_WINDOW = 5;          // majority vote window (frames)
-const REQUIRE_VAD = true;       // set false to test without RMS gating
+// Game controls
+const startGameBtn = $('#startGameBtn') as HTMLButtonElement;
+const pauseGameBtn = $('#pauseGameBtn') as HTMLButtonElement;
+const resetGameBtn = $('#resetGameBtn') as HTMLButtonElement;
+const gameCanvas = $('#gameCanvas') as HTMLCanvasElement;
+const game = new InfiniteRunnerGame(gameCanvas);
 
-// MFCC extraction options (matches mfcc.ts robust behavior)
-const MFCC_OPTS = {
-  trimThreshold: 0.003,
-  allowUntrimFallback: true,
-  padToFrame: true,
-};
-
-/** ───────────────────────── State ───────────────────────── **/
-let audioCtx: AudioContext | null = null;
-let sourceNode: MediaStreamAudioSourceNode | null = null;
-let processor: ScriptProcessorNode | null = null;
-let stream: MediaStream | null = null;
-let sampleRate = 44100;
-
-const captureBuf: Float32Array[] = []; // rolling capture (~5s)
-const leftSamples: Float32Array[] = [];
-const rightSamples: Float32Array[] = [];
-
-let worker: Worker | null = null;
-let listenTimer: number | null = null;
-
-/** ───────────────────────── Debug panel ───────────────────────── **/
+// Debug HUD
 const dbg = (() => {
   const host = document.createElement('div');
   host.style.cssText =
@@ -67,17 +47,53 @@ const dbg = (() => {
   const probEl = host.querySelector('#dbg-prob') as HTMLDivElement;
   const noteEl = host.querySelector('#dbg-note') as HTMLDivElement;
   return {
-    setRMS(v: number) {
-      rmsEl.textContent = `RMS: ${v.toFixed(4)}`;
-    },
-    setProb(p: number[]) {
-      probEl.textContent = `P(left,right): [${p.map((n) => n.toFixed(2)).join(', ')}]`;
-    },
-    note(s: string) {
-      noteEl.textContent = s;
-    },
+    setRMS(v: number) { rmsEl.textContent = `RMS: ${v.toFixed(4)}`; },
+    setProb(p: number[]) { probEl.textContent = `P(left,right): [${p.map(n => n.toFixed(2)).join(', ')}]`; },
+    note(s: string) { noteEl.textContent = s; }
   };
 })();
+
+function log(s: string) {
+  logEl.textContent += s + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/** ───────────────────────── Config knobs ───────────────────────── **/
+// Hysteretic VAD so we don't flicker
+const VAD_ENTER = 0.005;
+const VAD_EXIT = 0.003;
+let CONF_THRESHOLD = 0.40;
+const PRED_WINDOW = 5;
+const REQUIRE_VAD = true;
+const MFCC_OPTS = { trimThreshold: 0.003, allowUntrimFallback: true, padToFrame: true };
+
+/** ───────────────────────── State ───────────────────────── **/
+let audioCtx: AudioContext | null = null;
+let sourceNode: MediaStreamAudioSourceNode | null = null;
+let processor: ScriptProcessorNode | null = null;
+let stream: MediaStream | null = null;
+let sampleRate = 44100;
+
+const captureBuf: Float32Array[] = []; // rolling capture (~5s)
+const leftSamples: Float32Array[] = [];
+const rightSamples: Float32Array[] = [];
+
+let worker: Worker | null = null;
+let listenTimer: number | null = null;
+
+// smoothing + segmentation
+const lastPreds: number[] = [];
+let inSpeech = false;
+let lastStable: 'LEFT' | 'RIGHT' | null = null;
+// NEW: fire one command per utterance
+let utteranceFired = false;
+
+function resetVotes() {
+  lastPreds.length = 0;
+  predEl.textContent = '…';
+  utteranceFired = false;
+  dbg.note('speech start (cleared votes)');
+}
 
 /** ───────────────────────── Audio capture ───────────────────────── **/
 function attachAudio() {
@@ -114,7 +130,7 @@ async function enableMic() {
 
 function beginSample(seconds = 1.2) {
   if (!processor) throw new Error('mic not enabled');
-  captureBuf.length = 0; // reset rolling window
+  captureBuf.length = 0; // reset rolling window for the prompted recording
   window.setTimeout(() => { /* window elapsed */ }, Math.max(200, seconds * 1000));
 }
 
@@ -123,10 +139,7 @@ function takeCapturedMono(): Float32Array {
   for (const c of captureBuf) total += c.length;
   const mono = new Float32Array(total);
   let off = 0;
-  for (const c of captureBuf) {
-    mono.set(c, off);
-    off += c.length;
-  }
+  for (const c of captureBuf) { mono.set(c, off); off += c.length; }
   return mono;
 }
 
@@ -138,21 +151,14 @@ function oneHot(index: number, classes = 2): number[] {
 }
 function rms(x: Float32Array): number {
   let s = 0;
-  for (let i = 0; i < x.length; i++) {
-    const v = x[i];
-    s += v * v;
-  }
+  for (let i = 0; i < x.length; i++) { const v = x[i]; s += v * v; }
   return Math.sqrt(s / Math.max(1, x.length));
 }
-function argmax(v: number[]): { idx: number; val: number } {
-  let bi = 0,
-    bv = -Infinity;
+function argmax(v: number[]): { idx: number, val: number } {
+  let bi = 0, bv = -Infinity;
   for (let i = 0; i < v.length; i++) if (v[i] > bv) { bv = v[i]; bi = i; }
   return { idx: bi, val: bv };
 }
-
-/** ───────────────────────── Smoothing ───────────────────────── **/
-const lastPreds: number[] = [];
 function pushPred(idx: number) {
   lastPreds.push(idx);
   if (lastPreds.length > PRED_WINDOW) lastPreds.shift();
@@ -166,13 +172,12 @@ function majority(): number | null {
   return best;
 }
 
-/** ───────────────────────── Worker bridge ───────────────────────── **/
+// worker bridge
 function ensureWorker(): Promise<void> {
   if (worker) return Promise.resolve();
   worker = new WorkerCtor();
   return callWorker({ action: 'init' }).then(() => { });
 }
-
 function callWorker(msg: any): Promise<any> {
   if (!worker) throw new Error('worker not ready');
   return new Promise((resolve, reject) => {
@@ -188,80 +193,71 @@ function callWorker(msg: any): Promise<any> {
   });
 }
 
-/** ───────────────────────── Train ───────────────────────── **/
+// train
 async function trainModel() {
   await ensureWorker();
 
   const X: number[][] = [];
   const y: number[][] = [];
-  leftSamples.forEach((x) => {
-    X.push(Array.from(x));
-    y.push(oneHot(0));
-  });
-  rightSamples.forEach((x) => {
-    X.push(Array.from(x));
-    y.push(oneHot(1));
-  });
-  if (X.length < 8) {
-    log('Need 4 left + 4 right before training.');
-    return;
-  }
+  leftSamples.forEach(x => { X.push(Array.from(x)); y.push(oneHot(0)); });
+  rightSamples.forEach(x => { X.push(Array.from(x)); y.push(oneHot(1)); });
+  if (X.length < 8) { log('Need 4 left + 4 right before training.'); return; }
 
   trainStatus.textContent = 'training...';
-  const modelOptions = {
-    task: 'classification',
-    outputDim: 2,
-    kernel: { type: 'rbf', sigma: 1.0 },
-    ridgeLambda: 1e-2,
-  };
+  const modelOptions = { task: 'classification', outputDim: 2, kernel: { type: 'rbf', sigma: 1.0 }, ridgeLambda: 1e-2 };
   await callWorker({ action: 'train', payload: { X, y, modelOptions } });
   trainStatus.textContent = 'trained ✔';
   listenBtn.disabled = false;
+  saveBtn.disabled = false;
   log('Training complete.');
 }
 
-/** ───────────────────────── Live listen loop ───────────────────────── **/
+// live listen
 async function livePredictTick() {
   if (!worker) return;
 
   // Take the last ~0.8s of audio
   const framesNeeded = Math.ceil(0.8 * sampleRate);
   const mono = takeCapturedMono();
-  const slice =
-    mono.length > framesNeeded ? mono.subarray(mono.length - framesNeeded) : mono;
+  const slice = mono.length > framesNeeded ? mono.subarray(mono.length - framesNeeded) : mono;
 
   const e = rms(slice);
   dbg.setRMS(e);
 
-  if (REQUIRE_VAD && e < VAD_RMS_THRESHOLD) {
-    predEl.textContent = '…'; // silence
+  // hysteretic VAD
+  const speechNow = !REQUIRE_VAD || (inSpeech ? e >= VAD_EXIT : e >= VAD_ENTER);
+
+  // VAD edges
+  if (!inSpeech && speechNow) {
+    inSpeech = true;
+    resetVotes();                 // clear old votes ONLY
+    // continue; we still extract features this tick
+  } else if (inSpeech && !speechNow) {
+    inSpeech = false;
+    predEl.textContent = '…';
+    dbg.note('silence');
+    return;
+  }
+
+  if (!inSpeech) {
+    predEl.textContent = '…';
     dbg.note('silence (below VAD threshold)');
     return;
   }
 
-  const feats = await extractFeaturesMonoFloat32(
-    slice,
-    sampleRate,
-    MFCC_OPTS
-  );
+  const feats = await extractFeaturesMonoFloat32(slice, sampleRate, MFCC_OPTS);
 
-  // Guard: empty/zero features → treat as silence
+  // guard: zero features
   let nonZero = false;
-  for (let i = 0; i < feats.length; i++) {
-    if (feats[i] !== 0) { nonZero = true; break; }
-  }
+  for (let i = 0; i < feats.length; i++) { if (feats[i] !== 0) { nonZero = true; break; } }
   if (!nonZero) {
     predEl.textContent = '…';
     dbg.note('no features (zeros)');
     return;
   }
 
-  const { y } = (await callWorker({
-    action: 'predict',
-    payload: { x: Array.from(feats) },
-  })) as { y: number[] };
+  const { y } = await callWorker({ action: 'predict', payload: { x: Array.from(feats) } }) as { y: number[] };
 
-  // Guard unexpected outputs
   if (!y || !Array.isArray(y) || y.length < 2 || !isFinite(y[0]) || !isFinite(y[1])) {
     predEl.textContent = '…';
     dbg.setProb([NaN, NaN]);
@@ -271,32 +267,44 @@ async function livePredictTick() {
 
   // Normalize to probabilities if they don't sum to 1
   const sum = y.reduce((a, b) => a + (isFinite(b) ? b : 0), 0);
-  const probs = sum > 1e-6 ? y.map((v) => v / sum) : y;
+  const probs = sum > 1e-6 ? y.map(v => v / sum) : y;
   dbg.setProb(probs);
 
   const { idx, val } = argmax(probs);
 
-  // Confidence gating (soft): show ephemeral label even if < threshold,
-  // but only feed smoothing buffer when confident.
-  if (val < CONF_THRESHOLD) {
-    predEl.textContent = idx === 0 ? 'LEFT' : 'RIGHT';
-    dbg.note(`low confidence (${val.toFixed(2)})`);
-    return;
-  }
+  // Ephemeral label for responsiveness
+  const ephemeralLabel = idx === 0 ? 'LEFT' : 'RIGHT';
+  predEl.textContent = ephemeralLabel;
 
-  pushPred(idx);
+  // Build stable majority only with confident frames
+  if (val >= CONF_THRESHOLD) pushPred(idx);
+
   const maj = majority();
-  const finalIdx = maj !== null ? maj : idx;
-  predEl.textContent = finalIdx === 0 ? 'LEFT' : 'RIGHT';
-  dbg.note(`conf=${val.toFixed(2)} (maj=${finalIdx === 0 ? 'L' : 'R'})`);
+  if (maj !== null) {
+    const label = maj === 0 ? 'LEFT' : 'RIGHT';
+    predEl.textContent = label;
+
+    // FIRE ONCE PER UTTERANCE (even if same as previous label)
+    if (!utteranceFired && val >= CONF_THRESHOLD) {
+      utteranceFired = true;
+      window.dispatchEvent(new CustomEvent('voice-command', { detail: { label } }));
+      lastStable = label;
+    }
+  } else {
+    dbg.note(`ephemeral: ${ephemeralLabel} (conf=${val.toFixed(2)})`);
+  }
 }
 
-/** ───────────────────────── Controls ───────────────────────── **/
 function startListening() {
   if (listenTimer) return;
+  // reset session state
+  lastPreds.length = 0;
+  inSpeech = false;
+  lastStable = null;
+  utteranceFired = false;
+
   listenTimer = window.setInterval(livePredictTick, 250);
   predEl.textContent = '…';
-  lastPreds.length = 0;
   dbg.note('listening…');
   log('Live listening started.');
 }
@@ -304,12 +312,53 @@ function stopListening() {
   if (!listenTimer) return;
   window.clearInterval(listenTimer);
   listenTimer = null;
+  inSpeech = false;
   dbg.note('stopped');
   log('Live listening stopped.');
 }
 
-/** ───────────────────────── UI wiring ───────────────────────── **/
-micBtn.onclick = () => enableMic().catch((e) => log('Mic error: ' + e.message));
+// persistence
+async function saveModel() {
+  try {
+    const { modelJSON, scaler } = await callWorker({ action: 'export' });
+    await saveModelToIDB(modelJSON, scaler);
+    log('Model saved to IndexedDB.');
+  } catch (e: any) {
+    log('Save error: ' + e.message);
+  }
+}
+async function loadModel() {
+  try {
+    await ensureWorker();
+    const payload = await loadModelFromIDB();
+    if (!payload) { log('No saved model in IndexedDB.'); return; }
+    await callWorker({ action: 'import', payload });
+    trainStatus.textContent = 'loaded ✔';
+    listenBtn.disabled = false;
+    saveBtn.disabled = false;
+    log('Model loaded from IndexedDB.');
+  } catch (e: any) {
+    log('Load error: ' + e.message);
+  }
+}
+async function resetModel() {
+  try {
+    await ensureWorker();
+    await callWorker({ action: 'reset' });
+    await deleteModelFromIDB();
+    trainStatus.textContent = 'not trained';
+    listenBtn.disabled = true;
+    saveBtn.disabled = true;
+    lastStable = null;
+    utteranceFired = false;
+    log('Model reset (worker + IndexedDB cleared).');
+  } catch (e: any) {
+    log('Reset error: ' + e.message);
+  }
+}
+
+// UI wiring
+micBtn.onclick = () => enableMic().catch(e => log('Mic error: ' + e.message));
 
 recLeftBtn.onclick = async () => {
   if (!audioCtx) return log('Enable mic first.');
@@ -341,15 +390,20 @@ recRightBtn.onclick = async () => {
   }, 1300);
 };
 
-trainBtn.onclick = () =>
-  trainModel().catch((e) => log('Train error: ' + e.message));
-
+trainBtn.onclick = () => trainModel().catch(e => log('Train error: ' + e.message));
 listenBtn.onclick = () => {
-  if (listenTimer) {
-    stopListening();
-    listenBtn.textContent = '🔎 Start Live Listen';
-  } else {
-    ensureWorker().then(startListening).catch((e) => log('Listen error: ' + e.message));
-    listenBtn.textContent = '⏹ Stop Live Listen';
-  }
+  if (listenTimer) { stopListening(); listenBtn.textContent = '🔎 Start Live Listen'; }
+  else { ensureWorker().then(startListening).catch(e => log('Listen error: ' + e.message)); listenBtn.textContent = '⏹ Stop Live Listen'; }
 };
+
+saveBtn.onclick = () => saveModel();
+loadBtn.onclick = () => loadModel();
+resetModelBtn.onclick = () => resetModel();
+
+// game controls
+startGameBtn.onclick = () => { game.start(); startGameBtn.disabled = true; pauseGameBtn.disabled = false; };
+pauseGameBtn.onclick = () => { game.pause(); startGameBtn.disabled = false; pauseGameBtn.disabled = true; };
+resetGameBtn.onclick = () => { game.reset(); startGameBtn.disabled = false; pauseGameBtn.disabled = true; };
+
+// Try auto-load a saved model on startup
+loadModel().catch(() => { });
